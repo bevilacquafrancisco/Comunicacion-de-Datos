@@ -1,7 +1,9 @@
 # Tarea N°1 — Comunicaciones Cableadas
 ## Bus Paralelo de 8 Bits entre Dos Arduino Uno
-**Comunicación de Datos | 4to año — Ingeniería en Computación**  
-**Autor:** Francisco Bevilacqua | **Versión firmware:** v4.0.0 | **Fecha:** 2026-04-26
+**Asignatura:** Comunicación de Datos — 4° año Ingeniería en Computación  
+**Autores:** Francisco Bevilacqua, Sebastian Clement  
+**Fecha:** 2026-04-22  
+**Versión del documento:** 1.0.0
 
 ---
 # Ejercicio 1: Comunicación Paralela de 8 bits Unidireccional
