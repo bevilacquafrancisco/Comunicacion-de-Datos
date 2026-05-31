@@ -3,7 +3,8 @@
 **Trabajo Práctico N.° 2 — Comunicaciones Inalámbricas**  
 Universidad Nacional de Rafaela — Ingeniería en Computación  
 Comunicación de Datos — 4.° año — 1.° Cuatrimestre 2026  
-Bevilacqua Francisco - Clement Sebastian
+Bevilacqua Francisco - Clement Sebastian  
+Fecha: 31/05/2026  
 
 > Sincronización de estado cromático RGB entre dos nodos Arduino UNO mediante protocolo NEC infrarrojo, con handshaking bidireccional por IR, control de errores por cabecera, persistencia en EEPROM y ARQ stop-and-wait.
 
