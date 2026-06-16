@@ -1,9 +1,8 @@
 # Dispositivo 1 — Esclavo IR
+## Documentación del Firmware
 
 > **TP3 Integrador — Comunicación de Datos**  
-> Ingeniería en Computación | Bevilacqua, Francisco — Clement, Sebastián | 8 de junio 2026  
-> Plataforma: ESP32 DevKit v1 | Framework: Arduino sobre ESP-IDF | Entorno: PlatformIO
-
+> Ingeniería en Computación | Bevilacqua, Francisco — Clement, Sebastián | Junio 2026
 
 ---
 
@@ -384,7 +383,7 @@ D1 guarda tres claves bajo el namespace `"d1_state"`:
 #define NVS_MAGIC_VAL   0xA5
 ```
 
-La primera vez que D1 arranca (NVS vacía), todas las claves retornan sus valores por defecto (0 en este caso). Sin el centinela, el firmware no podría distinguir entre "el último color guardado era negro/apagado (0,0,0)" y "nunca se guardó nada". El centinela `0xA5` (`10100101` en binario — patrón con bits alternados elegido por su baja probabilidad de aparecer por corrupción) resuelve esto: si no está presente con el valor exacto, los datos se consideran inválidos.
+La primera vez que D1 arranca (NVS vacía), todas las claves retornan sus valores por defecto (0 en este caso). Sin el centinela, el firmware no podría distinguir entre "el último color guardado era negro (0,0,0)" y "nunca se guardó nada". El centinela `0xA5` (`10100101` en binario — patrón con bits alternados elegido por su baja probabilidad de aparecer por corrupción) resuelve esto: si no está presente con el valor exacto, los datos se consideran inválidos.
 
 ### Implementación de escritura
 
@@ -644,6 +643,5 @@ Con el Monitor Serial abierto (`Ctrl+Alt+S` en VS Code), el firmware imprime el 
 
 ---
 
-*Documentación del Dispositivo 1 — TP3 Integrador, Comunicación de Datos.*  
-*Bevilacqua, Francisco — Clement, Sebastián — Junio 2026.*  
-*Ingeniería en Computación | Universidad Nacional de Rafaela.*
+*Documentación elaborada en el marco del TP3 Integrador — Comunicación de Datos, Ingeniería en Computación.*  
+*Bevilacqua, Francisco — Clement, Sebastián — Junio 2026.*
