@@ -75,7 +75,7 @@
  *  Debe mantenerse sincronizada con la tabla COLORES[] en config.h de D2.
  *
  * @authors Bevilacqua, Francisco - Clement, Sebastian
- * @date    14 de junio 2026
+ * @date    29 de junio 2026
  */
 
 #pragma once
@@ -378,6 +378,38 @@ function calcularCRC16(str) {
 }
 
 /**
+ * Reescribe el campo "crc16":<decimal> de un JSON ya serializado a formato
+ * hexadecimal "crc16":"0xXXXX", SOLO para que los logs de consola sean
+ * directamente comparables con los del monitor serial de D2 (que tambien
+ * logea el CRC-16 en hexadecimal). Funcion simetrica a la de D2 (C++):
+ * misma logica de busqueda de la clave "crc16": y reemplazo del valor.
+ *
+ * IMPORTANTE: esta funcion es puramente cosmetica para console.log/debug.
+ * Nunca se usa sobre el string que efectivamente se envia por WebSocket
+ * (ws.send siempre recibe el JSON original, con crc16 numerico estandar).
+ *
+ * @param {string} jsonStr  JSON ya serializado, con "crc16":<decimal>.
+ * @returns {string}        Mismo JSON con "crc16" reescrito en hexadecimal.
+ */
+function formatearJsonParaLog(jsonStr) {
+  const clave = '"crc16":';
+  const pos = jsonStr.indexOf(clave);
+  if (pos === -1) return jsonStr;   // sin campo crc16: devolver tal cual
+
+  const inicioValor = pos + clave.length;
+  let finValor = inicioValor;
+  while (finValor < jsonStr.length && jsonStr[finValor] >= '0' && jsonStr[finValor] <= '9') {
+    finValor++;
+  }
+
+  const valorDecimal = jsonStr.slice(inicioValor, finValor);
+  if (valorDecimal.length === 0) return jsonStr;   // formato inesperado: no tocar
+
+  const crcNum = parseInt(valorDecimal, 10);
+  return jsonStr.slice(0, inicioValor) + '"' + crcHex(crcNum) + '"' + jsonStr.slice(finValor);
+}
+
+/**
  * Serializa un objeto JS con el campo crc16 firmado.
  *
  * Proceso:
@@ -401,7 +433,7 @@ function serializarConCRC(obj) {
   const final = JSON.stringify(obj);      // JSON final con crc16
   console.debug('[CRC-16] TX | base=' + base +
                 ' | crc=0x' + crc.toString(16).toUpperCase().padStart(4,'0') +
-                ' | final=' + final);
+                ' | final=' + formatearJsonParaLog(final));
   return final;
 }
 
@@ -450,6 +482,7 @@ let pongTimer                    = null;
 let estadoActual                 = { encendido: false, color: null, r: 0, g: 0, b: 0 };
 let esperandoRespuesta           = false;
 let desconectandoVoluntariamente = false; // distingue cierre voluntario de abrupto
+let ultimoCrcTxComando            = null;  // CRC-16 del ultimo comando enviado (no PING/PONG)
 
 // ═══════════════════════════════════════════════════════════════
 //  CONSTRUCCION DE LA GRILLA DE COLORES
@@ -501,7 +534,10 @@ function conectar() {
   };
 
   ws.onmessage = (evt) => {
-    console.log('[WS] RX crudo: ' + evt.data);
+    // El log usa formatearJsonParaLog para mostrar "crc16" en hexadecimal,
+    // directamente comparable con el monitor serial de D2. El JSON.parse()
+    // sigue operando sobre evt.data original (formato estandar, sin tocar).
+    console.log('[WS] RX crudo: ' + formatearJsonParaLog(evt.data));
     try {
       const msg = JSON.parse(evt.data);
       procesarMensaje(msg);
@@ -592,7 +628,9 @@ function iniciarPing() {
   detenerPing();
   pingTimer = setInterval(() => {
     if (!ws || ws.readyState !== WebSocket.OPEN) return;
-    console.debug('[PING] Enviando PING a D2');
+    // Sin log de "Enviando PING": es trafico rutinario de heartbeat, no
+    // un mensaje de comando. El warning de timeout SI se mantiene, porque
+    // representa un fallo real de conexion (no trafico normal PING-PONG).
     enviar({ tipo: 'PING' });
     pongTimer = setTimeout(() => {
       console.warn('[PING] Timeout de PONG -- conexion muerta, cerrando socket');
@@ -615,28 +653,44 @@ function detenerPing() {
  *
  * Flujo de validacion y despacho:
  *  1. Validar CRC-16 (validarCRC). Si falla -> log, setCrcStatus(false), retornar.
- *  2. Actualizar indicador visual de CRC (setCrcStatus).
+ *  2. Actualizar indicador visual de CRC (setCrcStatus) -- SOLO para mensajes
+ *     de comando; PING/PONG nunca tocan la GUI ni la consola con un log de
+ *     "mensaje procesado", para no saturar la interfaz con el heartbeat.
  *  3. Despachar por campo "tipo":
- *     - PONG            -> cancelar timer de timeout del keepalive.
+ *     - PONG            -> cancelar timer de timeout del keepalive (sin logs).
  *     - CRC_ERROR       -> D2 rechazo un mensaje de D3 (banner de aviso).
  *     - ACK_DESCONECTAR -> D2 acepto CMD_DESCONECTAR; D3 cierra el socket.
  *     - ESTADO_ACTUAL   -> actualizar UI con el estado al conectar.
  *     - RESULTADO_CMD   -> actualizar UI con el resultado del ciclo IR.
  *
+ * Para todo mensaje de comando, el indicador #crc-status muestra el CRC-16
+ * recibido de D2 (msg.crc16) junto con el CRC-16 que D3 envio en el comando
+ * que disparo esa respuesta (ultimoCrcTxComando), permitiendo verificar a
+ * simple vista que ambos extremos calculan el mismo valor sobre el mismo
+ * payload. El log detallado de la trama JSON completa permanece solo en la
+ * consola del navegador (F12); la GUI en si solo expone exito/fracaso + CRC.
+ *
  * @param {Object} msg  Objeto JS parseado del mensaje WebSocket recibido.
  */
 function procesarMensaje(msg) {
+  const esKeepalive = (msg.tipo === 'PONG');
+
   if (!validarCRC(msg)) {
-    setCrcStatus(false, 'CRC-16 invalido en "' + (msg.tipo || '?') + '"');
+    if (!esKeepalive) {
+      setCrcStatus(false, 'CRC-16 invalido en "' + (msg.tipo || '?') + '"');
+    }
     console.error('[CRC-16] Mensaje descartado por CRC invalido:', msg);
     return;
   }
-  setCrcStatus(true, 'CRC-16 OK · tipo=' + msg.tipo);
-  console.log('[WS] RX procesado: tipo=' + msg.tipo, msg);
 
-  // Respuesta al keepalive: cancelar timeout de PONG
+  // El indicador de la GUI y el log de "RX procesado" se omiten para PONG:
+  // es trafico de heartbeat, no un mensaje de comando que el usuario deba ver.
+  if (!esKeepalive) {
+    console.log('[WS] RX procesado: tipo=' + msg.tipo, msg);
+  }
+
+  // Respuesta al keepalive: cancelar timeout de PONG (sin tocar la GUI)
   if (msg.tipo === 'PONG') {
-    console.debug('[PING] PONG recibido de D2 -- conexion activa');
     clearTimeout(pongTimer);
     return;
   }
@@ -644,6 +698,8 @@ function procesarMensaje(msg) {
   // D2 rechazo un mensaje nuestro por CRC-16 invalido
   if (msg.tipo === 'CRC_ERROR') {
     console.warn('[CRC-16] D2 reporto CRC_ERROR:', msg.info);
+    setCrcStatus(false, 'CRC_ERROR · tx=' + crcHex(ultimoCrcTxComando) +
+                        '  rx=' + crcHex(msg.crc16));
     mostrarBanner('warn', 'D2 rechazo un mensaje: ' + (msg.info || 'CRC invalido'));
     esperandoRespuesta = false;
     return;
@@ -652,6 +708,8 @@ function procesarMensaje(msg) {
   // D2 confirmo CMD_DESCONECTAR; ahora D3 cierra el socket (codigo 1000 = normal)
   if (msg.tipo === 'ACK_DESCONECTAR') {
     console.log('[WS] ACK_DESCONECTAR recibido -- cerrando socket desde D3');
+    setCrcStatus(true, 'ACK_DESCONECTAR · tx=' + crcHex(ultimoCrcTxComando) +
+                       '  rx=' + crcHex(msg.crc16));
     if (ws && ws.readyState === WebSocket.OPEN) {
       ws.close(1000, 'Cierre voluntario iniciado por D3');
     }
@@ -667,6 +725,9 @@ function procesarMensaje(msg) {
                      r: msg.r, g: msg.g, b: msg.b };
     actualizarUI();
     esperandoRespuesta = false;
+    // No hubo comando previo de D3 (es el push automatico al conectar),
+    // por lo que solo se muestra el CRC-16 recibido de D2.
+    setCrcStatus(true, 'ESTADO_ACTUAL · rx=' + crcHex(msg.crc16));
     return;
   }
 
@@ -681,6 +742,14 @@ function procesarMensaje(msg) {
     actualizarUI();
     esperandoRespuesta = false;
 
+    // Indicador de CRC: muestra el par tx (comando que disparo esta
+    // respuesta) / rx (esta misma respuesta), para verificar a simple
+    // vista que ambos extremos calcularon el mismo CRC-16 sobre el
+    // payload correspondiente.
+    setCrcStatus(true, (msg.exito ? 'OK' : 'SIN ACK') +
+                       ' · tx=' + crcHex(ultimoCrcTxComando) +
+                       '  rx=' + crcHex(msg.crc16));
+
     if (msg.exito) {
       mostrarBanner('info', 'Comando aplicado -- ' + (msg.color || 'APAGADO') +
                     '  RGB(' + msg.r + ', ' + msg.g + ', ' + msg.b + ')');
@@ -694,6 +763,19 @@ function procesarMensaje(msg) {
   console.warn('[WS] Tipo de mensaje desconocido:', msg.tipo);
 }
 
+/**
+ * Formatea un CRC-16 numerico como string hexadecimal "0xXXXX" para mostrar
+ * en la GUI. Devuelve "—" si el valor es null/undefined (por ejemplo, antes
+ * de que D3 haya enviado su primer comando en la sesion).
+ *
+ * @param {number|null} crc  Valor de CRC-16 a formatear.
+ * @returns {string}         Representacion hexadecimal de 4 digitos, o "—".
+ */
+function crcHex(crc) {
+  if (crc === null || crc === undefined) return '—';
+  return '0x' + crc.toString(16).toUpperCase().padStart(4, '0');
+}
+
 // ═══════════════════════════════════════════════════════════════
 //  COMANDOS D3 -> D2 (con CRC-16)
 // ═══════════════════════════════════════════════════════════════
@@ -703,6 +785,11 @@ function procesarMensaje(msg) {
  *
  * Throttle: mientras esperandoRespuesta sea true, solo se permiten
  * PING y CMD_DESCONECTAR (que no inician un ciclo IR en D2).
+ *
+ * El CRC-16 calculado se guarda en ultimoCrcTxComando para los mensajes
+ * de comando (no PING/PONG), de forma que la GUI pueda mostrarlo junto
+ * al CRC-16 recibido en la respuesta y permitir la verificacion visual
+ * de que ambos extremos calcularon el mismo valor.
  *
  * @param {Object} obj  Comando a enviar (sin crc16; se agrega aqui).
  */
@@ -715,8 +802,16 @@ function enviar(obj) {
     return;
   }
 
-  const json = serializarConCRC(obj);
-  console.log('[WS] TX: ' + json);
+  const esKeepalive = (obj.tipo === 'PING');
+  const json = serializarConCRC(obj);   // obj.crc16 queda asignado in-place
+
+  // El log crudo de TX se omite para PING: no es un mensaje de comando.
+  // formatearJsonParaLog muestra "crc16" en hex, comparable con D2.
+  if (!esKeepalive) {
+    console.log('[WS] TX: ' + formatearJsonParaLog(json));
+    ultimoCrcTxComando = obj.crc16;
+  }
+
   ws.send(json);
 
   if (obj.tipo !== 'PING' && obj.tipo !== 'CMD_DESCONECTAR') {
@@ -851,8 +946,14 @@ function ocultarBanner() {
 
 /**
  * Actualiza el indicador de integridad CRC visible en la UI.
+ *
+ * Desde la refactorizacion de logs, el texto recibido ya incluye el par
+ * "tx=0xXXXX  rx=0xXXXX" (CRC-16 enviado por D3 en el comando / CRC-16
+ * recibido en la respuesta de D2), permitiendo verificar visualmente que
+ * ambos extremos calcularon el mismo valor. Nunca se llama para PING/PONG.
+ *
  * @param {boolean} ok     true = CRC valido, false = error de integridad.
- * @param {string}  texto  Descripcion del estado (tipo del mensaje, etc.).
+ * @param {string}  texto  Descripcion del estado (resultado + CRC tx/rx).
  */
 function setCrcStatus(ok, texto) {
   const el = document.getElementById('crc-status');

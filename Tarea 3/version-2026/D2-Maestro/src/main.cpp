@@ -105,7 +105,7 @@
  *  - Preferences (ESP32 Arduino Core)
  *
  * @authors Bevilacqua, Francisco — Clement, Sebastián
- * @date    14 de junio 2026
+ * @date    29 de junio 2026
  */
 
 // config.h debe ser el PRIMER include: define IR_SEND_PIN antes de IRremote.hpp
@@ -118,6 +118,7 @@
 #include <AsyncWebSocket.h>
 #include <ArduinoJson.h>
 #include <Preferences.h>
+#include <ctype.h>    // isdigit() — usado en formatearJsonParaLog()
 
 #include "web_ui.h"   // Interfaz web D3 embebida en flash
 
@@ -144,6 +145,23 @@ volatile uint8_t g_pendiente         = 0;
 volatile uint8_t b_pendiente         = 0;
 volatile uint8_t colorIdx_pendiente  = 0;
 volatile bool    encendido_pendiente = false;
+volatile unsigned long ultimo_msj_ws = 0;  ///< Tiempo del último mensaje recibido de D3
+
+// CRC-16 del comando de D3 que disparó el ciclo IR en curso (Etapa ① del
+// flujo D3→D2→D1→D2→D3). Se capturan en procesarMensajeWS() al validar el
+// comando y se conservan durante todo el ciclo IR para poder mostrarlos,
+// junto a los CRC-8 de D1 y el CRC-16 de la respuesta, en un resumen final
+// comparativo (ejecutarCicloIR()) — sin esto, el CRC-16 de D3 sólo se vería
+// en el log de recepción, separado por todo el bloque IR del resto del ciclo.
+volatile uint16_t crc16_rx_pendiente   = 0;   ///< CRC-16 recibido en el JSON de D3
+volatile uint16_t crc16_calc_pendiente = 0;   ///< CRC-16 recalculado por D2 sobre el mismo payload
+
+// CRC-8 de la última trama COMANDO enviada (Etapa ②) y del último ACK
+// válido recibido de D1 (Etapa ③). Se actualizan dentro de enviarColorIR()
+// en cada intento; al finalizar el ciclo (con o sin éxito) reflejan los
+// valores del último intento, para el resumen comparativo de 4 firmas.
+volatile uint8_t  crc8_cmd_ultimo = 0;   ///< CRC-8/MAXIM de la trama COMANDO (D2→D1)
+volatile uint8_t  crc8_ack_ultimo = 0;   ///< CRC-8/MAXIM invertido del ACK (D1→D2)
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  PROTOTIPOS
@@ -153,6 +171,8 @@ void     iniciarLedc();
 void     setColor(uint8_t r, uint8_t g, uint8_t b);
 uint8_t  calcularCRC8(uint8_t r, uint8_t g, uint8_t b);
 uint16_t calcularCRC16(const char *payload, size_t len);
+void     formatearJsonParaLog(const char *json_in, uint16_t crc,
+                               char *out, size_t out_size);
 void     guardarNVS();
 void     cargarNVS();
 bool     enviarColorIR(uint8_t r, uint8_t g, uint8_t b);
@@ -265,6 +285,69 @@ uint16_t calcularCRC16(const char *payload, size_t len) {
         }
     }
     return crc;   // [BLOQUE-CRC16] Resultado de 16 bits
+}
+
+/**
+ * @brief Reescribe el campo "crc16":<decimal> de un JSON ya serializado a
+ *        formato hexadecimal SOLO para fines de log por monitor serial.
+ *
+ * @section motivo Por qué existe esta función
+ *
+ *  ArduinoJson serializa los campos numéricos en decimal (ej. "crc16":12582),
+ *  mientras que el resto de los logs de este firmware muestran el CRC-16 en
+ *  hexadecimal (ej. CRC-16=0x3126). Esa mezcla decimal/hex dentro de una
+ *  misma línea de log dificulta contrastar a simple vista el valor mostrado
+ *  en D2 contra el que muestra la consola del navegador de D3 (que también
+ *  loguea en hex). Esta función NO altera el JSON real transmitido por
+ *  WebSocket — solo genera una copia de texto para Serial.print, dejando
+ *  buf_final intacto para que D3 lo parsee con JSON.parse() sin cambios.
+ *
+ * @section implementacion Implementación
+ *
+ *  Busca la subcadena literal `"crc16":` dentro de json_in, copia todo lo
+ *  anterior a out tal cual, y en lugar del número decimal que sigue escribe
+ *  `"0xXXXX"` (como string, entre comillas, para que quede visualmente
+ *  inequívoco que es hexadecimal). Luego copia el resto del JSON (la llave
+ *  de cierre) sin modificar. Si la subcadena no se encuentra (no debería
+ *  ocurrir, ya que todo mensaje saliente de D2 lleva "crc16"), se copia el
+ *  JSON original sin cambios como salvaguarda defensiva.
+ *
+ * @param json_in   JSON final ya serializado, con "crc16":<decimal> incluido.
+ * @param crc       Valor de CRC-16 conocido (evita tener que parsear json_in).
+ * @param out       Buffer de salida donde escribir el JSON con CRC en hex.
+ * @param out_size  Tamaño total del buffer out.
+ */
+void formatearJsonParaLog(const char *json_in, uint16_t crc,
+                           char *out, size_t out_size) {
+    const char *clave   = "\"crc16\":";
+    const char *pos_clave = strstr(json_in, clave);
+
+    if (!pos_clave) {
+        // [BLOQUE-LOG-HEX] Salvaguarda: sin "crc16" en el JSON, copiar tal cual
+        snprintf(out, out_size, "%s", json_in);
+        return;
+    }
+
+    // [BLOQUE-LOG-HEX] Posición donde empieza el valor numérico tras la clave
+    const char *inicio_valor = pos_clave + strlen(clave);
+
+    // [BLOQUE-LOG-HEX] Avanzar hasta el primer caracter que no sea parte del
+    // número decimal (la llave de cierre '}' o una coma si hay mas campos)
+    const char *fin_valor = inicio_valor;
+    while (*fin_valor && (isdigit((unsigned char)*fin_valor))) {
+        fin_valor++;
+    }
+
+    size_t len_prefijo = (size_t)(pos_clave - json_in) + strlen(clave);
+
+    // [BLOQUE-LOG-HEX] Reconstruir: prefijo + clave + "0xXXXX" + resto del JSON
+    int escrito = snprintf(out, out_size, "%.*s\"0x%04X\"%s",
+                            (int)len_prefijo, json_in, crc, fin_valor);
+
+    if (escrito < 0 || (size_t)escrito >= out_size) {
+        // [BLOQUE-LOG-HEX] Buffer insuficiente: salvaguarda con el JSON original
+        snprintf(out, out_size, "%s", json_in);
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -413,6 +496,7 @@ void cargarNVS() {
 bool enviarColorIR(uint8_t r, uint8_t g, uint8_t b) {
     // [BLOQUE-CRC8] Calcular CRC-8/MAXIM con init=0xFF
     uint8_t crc_tx = calcularCRC8(r, g, b);
+    crc8_cmd_ultimo = crc_tx;   // [RESUMEN-4-FIRMAS] Etapa ② — CRC-8 de la trama COMANDO
 
     // [BLOQUE-IR-TX] Construir trama de COMANDO: [R][G][B][CRC8_normal]
     uint32_t trama = ((uint32_t)r     << 24) |
@@ -489,6 +573,7 @@ bool enviarColorIR(uint8_t r, uint8_t g, uint8_t b) {
             Serial.printf( "[IR-RX] ACK confirmado: R=%u  G=%u  B=%u  CRC=0x%02X\n",
                            ack_r, ack_g, ack_b, ack_crc);
             Serial.println("[IR-RX] ─────────────────────────────────────────");
+            crc8_ack_ultimo = ack_crc;   // [RESUMEN-4-FIRMAS] Etapa ③ — CRC-8 (~CRC) del ACK
             return true;
         }
 
@@ -557,7 +642,6 @@ void ejecutarCicloIR() {
         Serial.println("[D2] Sin ACK tras todos los reintentos — estado sin cambios");
     }
 
-    Serial.println("[D2] ══════════════════════════════\n");
     notificarD3Estado(ack);
 }
 
@@ -578,10 +662,25 @@ void ejecutarCicloIR() {
  * El CRC se calcula sobre el JSON sin "crc16" para evitar dependencia
  * circular (no se puede incluir el CRC en el dato sobre el que se calcula).
  *
+ * @section filtro_log_keepalive Filtro de logs para PING/PONG
+ *
+ *  La lógica de cálculo y envío del CRC-16 es idéntica para todos los tipos
+ *  de mensaje, incluido PONG. Lo único que se suprime es la línea de log
+ *  "[WS-TX] → cliente ... " cuando el mensaje a enviar es PONG, para no
+ *  saturar el monitor serial con el tráfico periódico de keepalive. Los
+ *  mensajes de comando/resultado (ESTADO_ACTUAL, RESULTADO_CMD, CRC_ERROR,
+ *  ACK_DESCONECTAR) siempre se loguean con su CRC-16 enviado.
+ *
  * @param client  Cliente WebSocket destinatario.
  * @param doc     Documento JSON a enviar (se modifica in-place agregando "crc16").
  */
 void enviarMensajeWS(AsyncWebSocketClient *client, JsonDocument &doc) {
+    // [BLOQUE-FILTRO-LOG] PONG es la única respuesta de keepalive que D2 ENVÍA;
+    // se silencia el log de "mensaje de comando" pero el CRC-16 se calcula y
+    // se transmite exactamente igual, sin ninguna rama distinta de código.
+    const char *tipo_tx = doc["tipo"] | "";
+    bool es_keepalive_tx = (strcmp(tipo_tx, "PONG") == 0);
+
     // [BLOQUE-CRC16] Serialización sin campo CRC para calcular
     char buf_base[300];
     size_t len_base = serializeJson(doc, buf_base, sizeof(buf_base));
@@ -595,8 +694,22 @@ void enviarMensajeWS(AsyncWebSocketClient *client, JsonDocument &doc) {
     serializeJson(doc, buf_final, sizeof(buf_final));
 
     client->text(buf_final);
-    Serial.printf("[WS-TX] → cliente #%u | CRC-16=0x%04X | %s\n",
-                  client->id(), crc, buf_final);
+
+    // [BLOQUE-LOG] Traza de envío — silenciada solo para PONG, nunca para
+    // mensajes de comando/resultado (ESTADO_ACTUAL, RESULTADO_CMD, CRC_ERROR,
+    // ACK_DESCONECTAR), que siempre muestran su CRC-16 enviado.
+    //
+    // El JSON que se imprime (buf_log) NO es el mismo que se transmitió
+    // (buf_final): en buf_log el campo "crc16" se reescribe en hexadecimal
+    // solo para que el log sea legible y comparable con el de D3 (que
+    // también logea en hex). El dato real enviado por WebSocket sigue
+    // siendo buf_final, con "crc16" numérico estándar.
+    if (!es_keepalive_tx) {
+        char buf_log[340];
+        formatearJsonParaLog(buf_final, crc, buf_log, sizeof(buf_log));
+        Serial.printf("[WS-TX] → cliente #%u | CRC-16=0x%04X | %s\n",
+                      client->id(), crc, buf_log);
+    }
 }
 
 /**
@@ -614,7 +727,12 @@ void enviarMensajeWSBroadcast(JsonDocument &doc) {
     serializeJson(doc, buf_final, sizeof(buf_final));
 
     ws.textAll(buf_final);
-    Serial.printf("[WS-TX] Broadcast | CRC-16=0x%04X | %s\n", crc, buf_final);
+
+    // [BLOQUE-LOG] buf_log reescribe "crc16" en hexadecimal solo para el log
+    // (ver formatearJsonParaLog); el dato real transmitido es buf_final.
+    char buf_log[340];
+    formatearJsonParaLog(buf_final, crc, buf_log, sizeof(buf_log));
+    Serial.printf("[WS-TX] Broadcast | CRC-16=0x%04X | %s\n", crc, buf_log);
 }
 
 /**
@@ -667,6 +785,30 @@ void notificarD3Estado(bool exito) {
     doc["g"]         = encendido ? COLORES[colorActual].g : 0;
     doc["b"]         = encendido ? COLORES[colorActual].b : 0;
 
+    // [REFACTORIZACION LOGS] Pre-calcular el CRC-16 de la respuesta
+    // para armar el bloque de resumen teórico (Flujo_CRC) antes de enviar
+    char buf_base[300];
+    size_t len_base = serializeJson(doc, buf_base, sizeof(buf_base));
+    uint16_t crc16_tx = calcularCRC16(buf_base, len_base);
+
+    // ------------------------------------------------------------------
+    //  BLOQUE INTEGRAL DE RESUMEN DE FIRMAS (Flujo D3 → D2 → D1 → D2 → D3)
+    // ------------------------------------------------------------------
+    Serial.println("\n[D2] ═════════ RESUMEN DE FIRMAS CRC (3 NODOS) ═════════");
+    Serial.printf( "[CRC-16] *1* Recibido en D2 desde D3 (Comando WS): 0x%04X\n", crc16_rx_pendiente);
+    
+    if (exito) {
+        Serial.printf( "[CRC-8]  *2* Enviado de D2 a D1 (Comando IR)   : 0x%02X\n", crc8_cmd_ultimo);
+        Serial.printf( "[CRC-8]  *3* Recibido en D2 desde D1 (ACK ~CRC) : 0x%02X\n", crc8_ack_ultimo);
+    } else {
+        Serial.printf( "[CRC-8]  *2* Enviado de D2 a D1 (Comando IR)   : 0x%02X\n", crc8_cmd_ultimo);
+        Serial.println("[CRC-8]  *3* Recibido en D2 desde D1 (ACK ~CRC) : FALLO / TIMEOUT");
+    }
+    
+    Serial.printf( "[CRC-16] *4* Enviado de D2 a D3 (Respuesta WS): 0x%04X\n", crc16_tx);
+    Serial.println("[D2] ════════════════════════════════════════════════════\n");
+    // ------------------------------------------------------------------
+
     Serial.printf("[WS] Notificando resultado → exito=%s  enc=%s  color=%s  RGB(%u,%u,%u)\n",
                   exito ? "SI" : "NO",
                   encendido ? "SI" : "NO",
@@ -675,7 +817,16 @@ void notificarD3Estado(bool exito) {
                   encendido ? COLORES[colorActual].g : 0,
                   encendido ? COLORES[colorActual].b : 0);
 
-    enviarMensajeWSBroadcast(doc);
+    // Enviar por WebSocket aprovechando el crc16_tx ya calculado (evita doble cálculo)
+    doc["crc16"] = crc16_tx;
+    char buf_final[320];
+    serializeJson(doc, buf_final, sizeof(buf_final));
+    ws.textAll(buf_final);
+
+    // Loguear el JSON enviado con formato hex
+    char buf_log[340];
+    formatearJsonParaLog(buf_final, crc16_tx, buf_log, sizeof(buf_log));
+    Serial.printf("[WS-TX] Broadcast | CRC-16=0x%04X | %s\n", crc16_tx, buf_log);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -720,31 +871,84 @@ void notificarD3Estado(bool exito) {
  *  era procesado de forma asimétrica por ESPAsyncWebServer, retrasando el
  *  evento DISCONNECT y causando latencia en los LEDs de D2.
  *
+ * @section filtro_log_keepalive Filtro de logs para PING/PONG
+ *
+ *  Los mensajes PING (recibidos) y PONG (respondidos, ver enviarMensajeWS())
+ *  no generan NINGÚN log en el monitor serial: ni el payload crudo recibido,
+ *  ni la línea de verificación "[CRC-16] rx=... calc=...", ni "tipo=PING",
+ *  ni "Integridad verificada", ni la traza de envío del PONG. El heartbeat
+ *  queda completamente silencioso para no saturar la consola con tráfico
+ *  periódico. La lógica de chequeo de conexión PING-PONG en sí no se
+ *  modifica: D2 sigue calculando y validando el CRC-16 de cada PING, y
+ *  sigue respondiendo PONG con su propio CRC-16 calculado correctamente —
+ *  simplemente no se imprime nada de eso por Serial.
+ *
+ *  Para cualquier otro tipo de mensaje (CMD_COLOR, CMD_ENCENDER, CMD_APAGAR,
+ *  CMD_DESCONECTAR, y los descartados por CRC inválido) todos los logs se
+ *  mantienen exactamente igual que antes, incluyendo siempre el CRC-16
+ *  recibido y calculado.
+ *
  * @param client   Cliente WS que envió el mensaje.
  * @param payload  Buffer del mensaje JSON recibido.
  * @param len      Longitud del payload en bytes.
  */
 void procesarMensajeWS(AsyncWebSocketClient *client,
                        const uint8_t *payload, size_t len) {
+    // [BLOQUE-PARSE] Copiar el payload a un buffer local null-terminado.
+    // El buffer que entrega ESPAsyncWebServer (payload/len) no garantiza
+    // terminador nulo; formatearJsonParaLog() y los logs con "%s" requieren
+    // un C-string válido, de modo que se trabaja sobre esta copia segura
+    // en lugar del puntero crudo del framework.
+    char payload_str[300];
+    size_t len_copia = (len < sizeof(payload_str) - 1) ? len : sizeof(payload_str) - 1;
+    memcpy(payload_str, payload, len_copia);
+    payload_str[len_copia] = '\0';
+
     // [BLOQUE-PARSE] Deserializar JSON recibido
     JsonDocument doc;
     DeserializationError err = deserializeJson(doc, payload, len);
     if (err) {
-        Serial.printf("[WS-RX] Error JSON: %s — payload: %.*s\n",
-                      err.c_str(), (int)len, (const char *)payload);
+        Serial.printf("[WS-RX] Error JSON: %s — payload: %s\n",
+                      err.c_str(), payload_str);
         return;
     }
 
-    // [BLOQUE-LOG] Log del mensaje crudo recibido
-    Serial.printf("[WS-RX] ← cliente #%u | %.*s\n",
-                  client->id(), (int)len, (const char *)payload);
+    // [BLOQUE-FILTRO-LOG] Determinar si es trafico de keepalive (PING).
+    // Este flag silencia TODOS los logs asociados a este mensaje, incluida
+    // la linea de verificacion de CRC-16. El calculo y la comparacion
+    // matematica del CRC (crc_rx == crc_calc) se siguen ejecutando igual
+    // para PING; solo se omite la impresion por Serial.
+    const char *tipo_preliminar = doc["tipo"] | "";
+    bool es_keepalive = (strcmp(tipo_preliminar, "PING") == 0);
 
-    // [BLOQUE-CRC16] Extraer campo CRC-16 del mensaje
+    // [BLOQUE-CRC16] Extraer campo CRC-16 del mensaje. Se hace ANTES del log
+    // del payload crudo (más abajo) para poder reescribir ese log con el
+    // CRC en hexadecimal en lugar del decimal que envía JSON.stringify en D3.
     if (!doc["crc16"].is<uint16_t>()) {
+        if (!es_keepalive) {
+            Serial.printf("[WS-RX] ← cliente #%u | %s\n",
+                          client->id(), payload_str);
+        }
         Serial.println("[CRC-16] Mensaje sin campo crc16 — descartado");
         return;
     }
     uint16_t crc_rx = doc["crc16"].as<uint16_t>();
+
+    // [BLOQUE-LOG] Log del mensaje crudo recibido (silenciado para PING).
+    //
+    // buf_log_rx reescribe "crc16":<decimal> (tal como lo serializa
+    // JSON.stringify en D3) a "crc16":"0xXXXX" SOLO para este log, de forma
+    // que el valor recibido sea directamente comparable, en el mismo
+    // formato hexadecimal, con el que muestra la consola del navegador de
+    // D3 y con el resto de los logs de CRC-16 de D2. El payload real ya fue
+    // parseado en doc/deserializeJson más arriba; esta copia es puramente
+    // cosmética para el monitor serial.
+    if (!es_keepalive) {
+        char buf_log_rx[340];
+        formatearJsonParaLog(payload_str, crc_rx, buf_log_rx, sizeof(buf_log_rx));
+        Serial.printf("[WS-RX] ← cliente #%u | %s\n",
+                      client->id(), buf_log_rx);
+    }
 
     // [BLOQUE-CRC16] Eliminar crc16, serializar y recalcular para verificar
     doc.remove("crc16");
@@ -752,12 +956,22 @@ void procesarMensajeWS(AsyncWebSocketClient *client,
     size_t len_check = serializeJson(doc, buf_check, sizeof(buf_check));
     uint16_t crc_calc = calcularCRC16(buf_check, len_check);
 
-    // [BLOQUE-LOG] Log de verificación CRC-16
-    Serial.printf("[CRC-16] rx=0x%04X  calc=0x%04X  base=%s\n",
-                  crc_rx, crc_calc, buf_check);
+    // [BLOQUE-LOG] Log de verificación CRC-16 — silenciado para PING/PONG.
+    // A pedido explicito, el heartbeat queda con CERO logs en el monitor
+    // serial: ni el payload crudo, ni esta linea de CRC, ni "tipo=", ni
+    // "Integridad verificada". El chequeo matematico de crc_rx == crc_calc
+    // SI se sigue ejecutando igual para PING (si fallara, simplemente no se
+    // responde el PONG y el timeout del lado de D3 detecta la conexion
+    // muerta); lo unico que cambia es que no se imprime nada por Serial.
+    if (!es_keepalive) {
+        Serial.printf("[CRC-16] rx=0x%04X  calc=0x%04X  base=%s\n",
+                      crc_rx, crc_calc, buf_check);
+    }
 
     if (crc_rx != crc_calc) {
-        Serial.printf("[CRC-16] ERROR — Integridad comprometida. Mensaje descartado.\n");
+        if (!es_keepalive) {
+            Serial.printf("[CRC-16] ERROR — Integridad comprometida. Mensaje descartado.\n");
+        }
         // [BLOQUE-CRC16] Notificar el error al cliente con su propio CRC-16
         JsonDocument err_doc;
         err_doc["tipo"] = MSG_CRC_ERROR;
@@ -765,18 +979,21 @@ void procesarMensajeWS(AsyncWebSocketClient *client,
         enviarMensajeWS(client, err_doc);
         return;
     }
-    Serial.println("[CRC-16] OK — Integridad verificada.");
 
     const char *tipo = doc["tipo"] | "";
-    Serial.printf("[WS-RX] tipo=%s\n", tipo);
 
-    // [BLOQUE-PING] Responder keepalive con PONG (también con CRC-16)
-    if (strcmp(tipo, "PING") == 0) {
+    // [BLOQUE-PING] Responder keepalive con PONG (también con CRC-16).
+    // Se retorna ANTES de loguear "Integridad verificada" / "tipo=" para que
+    // el trafico periodico PING-PONG no aparezca como mensaje de comando.
+    if (es_keepalive) {
         JsonDocument pong;
         pong["tipo"] = "PONG";
         enviarMensajeWS(client, pong);
         return;
     }
+
+    Serial.println("[CRC-16] OK — Integridad verificada.");
+    Serial.printf("[WS-RX] tipo=%s\n", tipo);
 
     // [BLOQUE-DESCONECTAR] Cierre voluntario solicitado por D3
     // Handshake: D2 responde ACK_DESCONECTAR y cierra la sesión desde el servidor,
@@ -798,7 +1015,32 @@ void procesarMensajeWS(AsyncWebSocketClient *client,
         return;
     }
 
+    // [BLOQUE-CRC16-PENDIENTE] Capturar el CRC-16 de este comando (Etapa ①
+    // del flujo D3→D2→D1→D2→D3) para poder mostrarlo en el resumen
+    // comparativo de las 4 firmas al final de ejecutarCicloIR(). En este
+    // punto crc_rx y crc_calc ya fueron validados como iguales más arriba;
+    // se guardan ambos para loguear el mismo par "recibido/recalculado"
+    // que documenta la Etapa 2 del flujo teórico (Flujo_CRC_VERDE).
+    crc16_rx_pendiente   = crc_rx;
+    crc16_calc_pendiente = crc_calc;
+
     if (strcmp(tipo, MSG_CMD_COLOR) == 0) {
+        // [CORRECCION] Control de estado: Si está apagado, se rechaza el comando de color
+        if (!encendido) {
+            Serial.println("[D2] CMD_COLOR descartado: El sistema se encuentra apagado.");
+            
+            // Re-enviamos el estado actual (apagado) a D3 para que la interfaz web deshaga
+            // el intento de cambio y vuelva a sincronizarse correctamente sin encenderse.
+            JsonDocument doc_estado;
+            doc_estado["tipo"]      = MSG_ESTADO_ACTUAL;
+            doc_estado["encendido"] = false;
+            doc_estado["color"]     = "";
+            doc_estado["r"]         = 0;
+            doc_estado["g"]         = 0;
+            doc_estado["b"]         = 0;
+            enviarMensajeWS(client, doc_estado);
+            return;  // Abortamos la ejecución para que no inicie el ciclo IR
+        }
         // [BLOQUE-CMD-COLOR] Cambiar al color indicado
         // D3 envía r, g, b junto al nombre simbólico; el CRC-16 cubre los valores numéricos.
         const char *nombre = doc["color"] | "";
@@ -889,6 +1131,7 @@ void onWsEvent(AsyncWebSocket       *server,
     switch (type) {
 
         case WS_EVT_CONNECT:
+            ultimo_msj_ws = millis();  // Iniciar contador al conectar
             // [BLOQUE-WS-CONN] Nueva conexión de D3
             Serial.printf("\n[WS] ── CONNECT ── Cliente #%u desde %s\n",
                           client->id(), client->remoteIP().toString().c_str());
@@ -905,6 +1148,7 @@ void onWsEvent(AsyncWebSocket       *server,
             break;
 
         case WS_EVT_DATA: {
+            ultimo_msj_ws = millis();  //Resetear contador al recibir datos
             // [BLOQUE-WS-DATA] Procesar solo mensajes de texto completos (no fragmentados)
             AwsFrameInfo *info = (AwsFrameInfo *)arg;
             if (info->final && info->index == 0 &&
@@ -1041,6 +1285,13 @@ void setup() {
 void loop() {
     // [BLOQUE-LOOP] Liberar recursos de clientes WS desconectados
     ws.cleanupClients();
+    // [NUEVO] Watchdog de WebSocket (Detector de Conexiones Zombi)
+    // D3 envía un PING periódico. Si pasan 10 segundos sin recibir NADA,
+    // asumimos que la conexión de red se cayó de forma abrupta.
+    if (ws.count() > 0 && (millis() - ultimo_msj_ws > 10000)) {
+        Serial.println("\n[WS] Timeout: Se perdió el contacto con D3. Forzando cierre...");
+        ws.closeAll(); // Esto dispara automáticamente WS_EVT_DISCONNECT
+    }
 
     // [BLOQUE-CICLO-IR] Ejecutar ciclo IR si hay comando pendiente de D3
     if (irPendiente) {
